@@ -12,14 +12,26 @@ from livekit.plugins import noise_cancellation
 
 from utils import load_prompt
 from database import CustomerDatabase
+import threading
+from api import app
+
+def run_api():
+    app.run(port=8000, use_reloader=False)
+
+api_thread = threading.Thread(target=run_api, daemon=True)
+api_thread.start()
 
 logger = logging.getLogger("personal-shopper")
 logger.setLevel(logging.INFO)
 
 load_dotenv()
 
-# Initialize the customer database
 db = CustomerDatabase()
+
+import requests
+
+API_URL = "http://localhost:8000/tshirts"
+
 
 @dataclass
 class UserData:
@@ -62,7 +74,6 @@ class BaseAgent(Agent):
         if userdata.ctx and userdata.ctx.room:
             await userdata.ctx.room.local_participant.set_attributes({"agent": agent_name})
 
-        # Create a personalized prompt based on customer identification
         custom_instructions = self.instructions
         if userdata.is_identified():
             custom_instructions += f"\n\nYou are speaking with {userdata.first_name} {userdata.last_name}."
@@ -71,7 +82,7 @@ class BaseAgent(Agent):
 
         # Copy context from previous agent if it exists
         if userdata.prev_agent:
-            items_copy = self._truncate_chat_ctx(
+            items_copy = self._truncate_chat_ctx(   
                 userdata.prev_agent.chat_ctx.items, keep_function_call=True
             )
             existing_ids = {item.id for item in chat_ctx.items}
@@ -128,7 +139,7 @@ class TriageAgent(BaseAgent):
         super().__init__(
             instructions=load_prompt('triage_prompt.yaml'),
             stt=deepgram.STT(),
-            llm=google.LLM(model="gemini-2.5-flash",temperature=0.4),
+            llm=openai.LLM(model="gpt-4o-mini"),
             tts=deepgram.TTS(),
             vad=silero.VAD.load()
         )
@@ -179,7 +190,7 @@ class SalesAgent(BaseAgent):
         super().__init__(
             instructions=load_prompt('sales_prompt.yaml'),
             stt=deepgram.STT(),
-            llm=google.LLM(model="gemini-2.5-flash",temperature=0.4),
+            llm=openai.LLM(model="gpt-4o-mini"),
             tts=deepgram.TTS(),
             vad=silero.VAD.load()
         )
@@ -298,7 +309,7 @@ class ReturnsAgent(BaseAgent):
         super().__init__(
             instructions=load_prompt('returns_prompt.yaml'),
             stt=deepgram.STT(),
-            llm=google.LLM(model="gemini-2.5-flash",temperature=0.4),
+            llm=openai.LLM(model="gpt-4o-mini"),
             tts=deepgram.TTS(),
             vad=silero.VAD.load()
         )
@@ -319,15 +330,15 @@ class ReturnsAgent(BaseAgent):
 
         return f"Thank you, {first_name}. I've found your account."
 
-    @function_tool
-    async def get_order_history(self):
-        """Get the order history for the current customer."""
-        userdata: UserData = self.session.userdata
-        if not userdata.is_identified():
-            return "Please identify the customer first using the identify_customer function."
+    # @function_tool
+    # async def get_order_history(self):
+    #     """Get the order history for the current customer."""
+    #     userdata: UserData = self.session.userdata
+    #     if not userdata.is_identified():
+    #         return "Please identify the customer first using the identify_customer function."
 
-        order_history = db.get_customer_order_history(userdata.first_name, userdata.last_name)
-        return order_history
+    #     order_history = db.get_customer_order_history(userdata.first_name, userdata.last_name)
+    #     return order_history
 
     @function_tool
     async def process_return(self, order_id: int, item_name: str, reason: str):
@@ -342,14 +353,31 @@ class ReturnsAgent(BaseAgent):
         userdata: UserData = self.session.userdata
         if not userdata.is_identified():
             return "Please identify the customer first using the identify_customer function."
+        response = requests.get(API_URL)
+        orders = response.json()
 
-        # In a real system, we would update the order in the database
-        # For this example, we'll just return a confirmation message
-        return f"Return processed for {item_name} from Order #{order_id}. Reason: {reason}. A refund will be issued within 3-5 business days."
+        matching_item = None
+        for item in orders:
+            if item.get("order_id") == order_id and item.get("item_name") == item_name:
+                matching_item = item
+                break
+
+        if not matching_item:
+            return f"Order #{order_id} with item {item_name} not found."
+
+        if matching_item.get("price", 0) <= 25:
+            return (
+                f"Return processed for {item_name} from Order #{order_id}. "
+                f"Reason: {reason}. A refund will be issued within 3-5 business days."
+            )
+        else:
+            return (
+                f"Sorry, {item_name} from Order #{order_id} "
+                f"is not eligible for return based on our policy."
+            )
 
     @function_tool
     async def transfer_to_triage(self, context: RunContext_T) -> Agent:
-        # Create a personalized message if customer is identified
         userdata: UserData = self.session.userdata
         if userdata.is_identified():
             message = f"Thank you, {userdata.first_name}. I'll transfer you back to our Triage agent who can better direct your inquiry."
@@ -361,7 +389,6 @@ class ReturnsAgent(BaseAgent):
 
     @function_tool
     async def transfer_to_sales(self, context: RunContext_T) -> Agent:
-        # Create a personalized message if customer is identified
         userdata: UserData = self.session.userdata
         if userdata.is_identified():
             message = f"Thank you, {userdata.first_name}. I'll transfer you to our Sales team who can help you find new products."
@@ -387,8 +414,6 @@ async def entrypoint(ctx: JobContext):
         "sales": sales_agent,
         "returns": returns_agent
     })
-
-    # Create session with userdata
     session = AgentSession[UserData](userdata=userdata)
 
     await session.start(
